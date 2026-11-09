@@ -54,10 +54,12 @@ class AnalysisResult(BaseModel):
     clarification: str | None = None
     operation: dict[str, Any] | None = None
     sql: str | None = None
+    query_parameters: list[Any] = Field(default_factory=list)
     columns: list[str] = Field(default_factory=list)
     rows: list[dict[str, Any]] = Field(default_factory=list)
     explanation: str | None = None
     chart: dict[str, Any] | None = None
+    provenance: dict[str, Any] | None = None
 
 
 class ExportRequest(BaseModel):

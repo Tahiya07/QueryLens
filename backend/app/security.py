@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from passlib.context import CryptContext
@@ -20,7 +21,25 @@ if _sqlite:
         cursor = connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.close()
-JWT_SECRET = os.getenv("QUERYLENS_SECRET_KEY", "local-development-secret-change-this-before-deploy")
+_DEVELOPMENT_SECRET = "local-development-secret-change-this-before-deploy"
+_KNOWN_WEAK_SECRETS = {_DEVELOPMENT_SECRET, "replace-with-a-random-secret-before-running", "change-me", "secret", "password"}
+
+
+def resolve_jwt_secret(environment: str, configured: str | None) -> str:
+    production = environment.lower() in {"prod", "production"}
+    if production:
+        if not configured or configured.lower() in _KNOWN_WEAK_SECRETS or len(configured.encode("utf-8")) < 48 or len(set(configured)) < 16:
+            raise RuntimeError("Production requires QUERYLENS_SECRET_KEY with at least 48 bytes of non-placeholder secret material and 16 distinct characters.")
+        return configured
+    if not configured:
+        warnings.warn("Using the development-only JWT secret. Set QUERYLENS_SECRET_KEY before deployment.", RuntimeWarning)
+        return _DEVELOPMENT_SECRET
+    if len(configured.encode("utf-8")) < 32:
+        warnings.warn("QUERYLENS_SECRET_KEY is shorter than 32 bytes; use a stronger secret.", RuntimeWarning)
+    return configured
+
+
+JWT_SECRET = resolve_jwt_secret(os.getenv("QUERYLENS_ENV", "development"), os.getenv("QUERYLENS_SECRET_KEY"))
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
@@ -90,4 +109,8 @@ def token_for(user_id: str):
 
 
 def decode_token(token: str):
-    return jwt.decode(token, JWT_SECRET, algorithms=["HS256"])["sub"]
+    claims = jwt.decode(token, JWT_SECRET, algorithms=["HS256"], options={"require": ["sub", "iat", "exp"]})
+    subject = claims.get("sub")
+    if not isinstance(subject, str) or not subject.strip():
+        raise jwt.InvalidTokenError("Token subject is invalid.")
+    return subject

@@ -9,10 +9,10 @@ Latest recorded run:
   "python": "3.12.6",
   "platform": "Windows-11-10.0.26300-SP0",
   "rows": 100000,
-  "profile_seconds": 0.0564,
-  "analysis_seconds": 0.0265,
-  "peak_rss_mb": 91.57
+  "profile_seconds": 0.0681,
+  "analysis_seconds": 0.0391,
+  "peak_rss_mb": 97.75
 }
 ```
 
-These are single-run local measurements, not a capacity guarantee. Rerun the script on the target machine. They exclude browser memory, upload/network time, concurrency, and PostgreSQL.
+This run was repeated during Milestone 2 after adding the typed operation planner and bounded DuckDB execution settings. These are single-run local measurements, not a capacity guarantee. Rerun the script on the target machine. They exclude browser memory, upload/network time, concurrency, and PostgreSQL. The analysis stage measures one grouped aggregation; it does not characterize large correlation, distribution, or calendar-expansion workloads.

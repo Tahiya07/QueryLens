@@ -7,15 +7,18 @@ QueryLens is a local-first data analysis workspace. Upload CSV or Excel files, i
 - [x] CSV/XLSX/XLS ingestion, size and dimension limits, header normalization
 - [x] Per-account dataset ownership, account registration/login, password hashing, signed expiring bearer tokens
 - [x] Profiling: types, missingness, unique values, numeric summaries, IQR outlier indicators, duplicates, correlations
-- [x] Deterministic intent parser; asks for clarification on unsupported or ambiguous requests
+- [x] Typed deterministic intent parser; asks for clarification on unsupported or ambiguous requests
 - [x] Restricted DuckDB query path with escaped allowlisted identifiers, bounded results, memory/thread limits
 - [x] Analysis history and CSV, XLSX, PDF exports
-- [x] Responsive dark workspace with dataset preview, profile table, analysis results and charts
+- [x] Responsive dark workspace with functional overview, dataset, analysis, query history/replay, settings, and documentation views
+- [x] Bar and line charts, vertical/horizontal bar configuration, accessible correlation heatmap, and bounded plotting
 - [x] Docker files, sample data, API docs, architecture and benchmark runner
-- [x] Backend tests for ingestion, profiling, intent, safety, accuracy, auth, isolation and exports
+- [x] Backend tests for ingestion, profiling, intent, filters, sorting, safety, accuracy, auth, isolation, provenance, and exports
 - [x] Versioned SQLite and PostgreSQL schema migrations
 - [x] Browser end-to-end journey and screenshot of an analyzed sample
-- [ ] Production session hardening, rate limiting, and operational monitoring
+- [x] Production signing-secret checks, tab-scoped sessions, configurable local rate limits, and DuckDB resource bounds
+- [x] Validated filter/sort/group operations and reproducibility metadata with dataset fingerprints
+- [ ] HttpOnly cookie sessions, shared multi-worker rate limiting, and operational monitoring
 
 The checked items are implemented; unchecked items are known work, not completed features. Do not expose this deployment directly to the public internet without addressing the listed production gaps.
 
@@ -91,16 +94,19 @@ The benchmark generates a deterministic 100,000-row in-memory frame and reports 
 - “Show unusual values in revenue” (IQR indicator; not an error diagnosis)
 - “Show monthly sales growth” (sums a date-aware measure and calculates period-over-period change)
 - “Correlation between revenue and units”
+- “Spearman correlation between revenue and units”
 - “Show a preview”
 
-Columns should be named explicitly when multiple numeric measures exist. Supported operations are intentionally limited: arbitrary filters and statistical significance tests are not implemented yet. Time series support monthly or daily period totals and change; more advanced forecasting is not included. Correlation is association, not causation. The parser's supported language is heuristic and responds with a clarification where it cannot identify a supported operation.
+Supported filters include equals/not equals, numeric and date comparisons, contains/starts with, missing/not missing, and between; conditions can be combined with AND or OR. Sorting and grouped top/bottom results are bounded to 500 rows and 500 groups. Columns should be named explicitly when multiple numeric measures exist. The parser's supported language is heuristic and responds with a clarification where it cannot identify a supported operation. Monthly/daily time series are period totals and change, not forecasts. Statistical significance tests are not implemented. Correlation is association, not causation.
 
 ## Data and security notes
 
 - Upload maximum: 25 MB; 500,000 rows; 300 columns.
 - Metadata uses SQLite by default or PostgreSQL when `QUERYLENS_DATABASE_URL` is configured. Dataset files remain in `QUERYLENS_DATA_DIR` on the API host.
-- Authentication uses bcrypt password hashes and 12-hour signed bearer tokens. The browser keeps the token in local storage; this is suitable for a local portfolio build but needs a hardened session design and rate limiting before public production use.
-- DuckDB operates on a registered in-memory dataframe. The application does not accept SQL input. Results are capped at 500 rows (50,000 source rows for correlation/distribution calculations), and DuckDB is configured for 512 MB and two threads.
+- Authentication uses bcrypt password hashes and 12-hour signed bearer tokens. Production mode rejects missing, placeholder, short, or low-diversity signing secrets. The browser keeps its token in tab-scoped `sessionStorage`; same-origin JavaScript can still access it, so this is not a complete production session design.
+- Local in-process rate limits cover signup, login, analysis, and exports without Redis. Counters and the analysis concurrency cap are per process, so multi-worker deployments do not share counters.
+- DuckDB operates on a registered in-memory dataframe. The application does not accept SQL input. Results are capped at 500 rows (50,000 source rows for correlation/distribution calculations), per-statement timeout defaults to 5 seconds, concurrency defaults to two analyses, and DuckDB memory defaults to 512 MB.
+- CSV and Excel exports escape formula-like text values while preserving numeric cells. Time-series output labels absent periods and missing/zero baselines rather than treating absent periods as zero.
 - XLS legacy files require `xlrd`; XLSX uses `openpyxl`. Encrypted files are rejected with a parse error.
 - PDF exports include dataset/question/calculation metadata and up to 35 result rows; XLSX exports have Results and Analysis sheets.
 - No local model is bundled or downloaded. LLM integration is not implemented and inference is disabled.

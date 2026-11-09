@@ -1,29 +1,64 @@
 from __future__ import annotations
-import io, json, logging, os, uuid
+import hashlib, io, json, logging, os, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Header, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, EmailStr, Field
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel, EmailStr, Field, field_validator
 import pandas as pd
 import jwt
+from sqlalchemy.exc import IntegrityError
 from . import security
-from .analysis import analyze
+from .analysis import AnalysisBusy, AnalysisTimeout, analyze
 from .ingest import read_dataset
+from .exports import safe_spreadsheet_frame
 from .profiling import profile
+from .rate_limit import LocalRateLimiter
 from .schemas import AnalysisRequest, AnalysisResult, DatasetDetail, DatasetSummary, ExportRequest, HealthResponse, TokenResponse
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("querylens")
 app = FastAPI(title="QueryLens API", version="0.1.0", description="Local-first, deterministic data analysis API")
+app.state.rate_limiter = LocalRateLimiter()
 origins = [x.strip() for x in os.getenv("QUERYLENS_CORS_ORIGINS", "http://localhost:3000").split(",") if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["GET","POST","DELETE"], allow_headers=["Authorization","Content-Type"])
+
+@app.middleware("http")
+async def apply_local_rate_limits(request, call_next):
+    path = request.url.path
+    scope = None
+    if path == "/api/auth/register": scope = "register"
+    elif path == "/api/auth/login": scope = "login"
+    elif path.startswith("/api/datasets/") and path.endswith("/analyze"): scope = "analysis"
+    elif path.startswith("/api/datasets/") and path.endswith("/export"): scope = "export"
+    if scope:
+        identity = request.client.host if request.client else "unknown"
+        allowed, retry_after = request.app.state.rate_limiter.consume(scope, identity)
+        if not allowed:
+            return Response("{\"detail\":\"Too many requests. Try again later.\"}", status_code=429, media_type="application/json", headers={"Retry-After":str(retry_after)})
+    return await call_next(request)
+
 security.initialize()
+
+@app.exception_handler(AnalysisTimeout)
+async def analysis_timeout_handler(_request, exc: AnalysisTimeout):
+    return JSONResponse(status_code=504, content={"detail":str(exc)})
+
+@app.exception_handler(AnalysisBusy)
+async def analysis_busy_handler(_request, exc: AnalysisBusy):
+    return JSONResponse(status_code=503, content={"detail":str(exc)}, headers={"Retry-After":"1"})
 
 class Credentials(BaseModel):
     email: EmailStr
     password: str = Field(min_length=10, max_length=128)
+
+    @field_validator("password")
+    @classmethod
+    def bcrypt_byte_limit(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > 72:
+            raise ValueError("Password must be at most 72 UTF-8 bytes.")
+        return value
 
 def current_user(authorization: str | None = Header(default=None)) -> str:
     if not authorization or not authorization.startswith("Bearer "):
@@ -49,11 +84,8 @@ def health(): return {"status":"ok", "llm_enabled":False}
 
 @app.post("/api/auth/register", response_model=TokenResponse)
 def register(credentials: Credentials):
-    if len(credentials.password) < 10: raise HTTPException(422, "Password must contain at least 10 characters.")
     try: user = security.create_user(credentials.email, credentials.password)
-    except Exception as exc:
-        if "UNIQUE" in str(exc): raise HTTPException(409, "An account with this email already exists.")
-        raise
+    except IntegrityError as exc: raise HTTPException(409, "An account with this email already exists.") from exc
     return {"token":security.token_for(user["id"]), "email":user["email"]}
 
 @app.post("/api/auth/login", response_model=TokenResponse)
@@ -99,10 +131,13 @@ def delete_dataset(dataset_id: str, user_id: str=Depends(current_user)):
 
 @app.post("/api/datasets/{dataset_id}/analyze", response_model=AnalysisResult)
 def run_analysis(dataset_id: str, request: AnalysisRequest, user_id: str=Depends(current_user)):
-    ds=owned_dataset(dataset_id,user_id); frame=load_frame(ds); result=analyze(frame,request.question)
+    ds=owned_dataset(dataset_id,user_id); path=security.DATA_DIR/"datasets"/ds["storage_name"]; frame=load_frame(ds); result=analyze(frame,request.question)
     if result["understood"]:
+        fingerprint=hashlib.sha256(path.read_bytes()).hexdigest()
+        timestamp=datetime.now(timezone.utc).isoformat()
+        result["provenance"]={"dataset_id":dataset_id,"dataset_fingerprint":fingerprint,"original_question":request.question,"operation":result.get("operation"),"selected_columns":result.get("columns",[]),"parameters":result.get("query_parameters",[]),"executed_at":timestamp,"result_rows":len(result.get("rows",[])),"limitations":["Results are bounded by the configured analysis row and resource limits.","Associations do not establish causation."]}
         with security.connect() as db:
-            db.execute("INSERT INTO analyses(dataset_id,owner_id,question,result_json,created_at) VALUES(?,?,?,?,?)",(dataset_id,user_id,request.question,json.dumps(result,allow_nan=False),datetime.now(timezone.utc).isoformat()))
+            db.execute("INSERT INTO analyses(dataset_id,owner_id,question,result_json,created_at) VALUES(?,?,?,?,?)",(dataset_id,user_id,request.question,json.dumps(result,allow_nan=False),timestamp))
     return result
 
 @app.get("/api/datasets/{dataset_id}/history")
@@ -117,24 +152,25 @@ def export(dataset_id: str, request: ExportRequest, user_id: str=Depends(current
     if not result["understood"]: raise HTTPException(422,result["clarification"])
     df=pd.DataFrame(result["rows"])
     if request.format=="csv":
-        return StreamingResponse(iter([df.to_csv(index=False)]),media_type="text/csv",headers={"Content-Disposition":"attachment; filename=querylens-results.csv"})
+        return StreamingResponse(iter([safe_spreadsheet_frame(df).to_csv(index=False)]),media_type="text/csv",headers={"Content-Disposition":"attachment; filename=querylens-results.csv"})
     if request.format=="xlsx":
+        safe_df = safe_spreadsheet_frame(df)
         output=io.BytesIO()
         with pd.ExcelWriter(output,engine="openpyxl") as writer:
-            df.to_excel(writer,index=False,sheet_name="Results")
-            pd.DataFrame([{"Dataset":ds["name"],"Question":request.question,"Calculation":result["explanation"],"Operation":json.dumps(result["operation"])}]).to_excel(writer,index=False,sheet_name="Analysis")
+            safe_df.to_excel(writer,index=False,sheet_name="Results")
+            safe_spreadsheet_frame(pd.DataFrame([{"Dataset":ds["name"],"Question":request.question,"Calculation":result["explanation"],"Operation":json.dumps(result["operation"])}])).to_excel(writer,index=False,sheet_name="Analysis")
             chart_spec=result.get("chart") or {}
             if chart_spec.get("type") in {"bar","line"} and len(df):
                 from openpyxl.chart import BarChart, LineChart, Reference
                 chart_type=LineChart if chart_spec["type"]=="line" else BarChart
                 chart=chart_type(); chart.title=result["explanation"][:80]; chart.style=10
                 y_name=chart_spec.get("y")
-                if y_name in df.columns:
-                    y_index=list(df.columns).index(y_name)+1
-                    chart.add_data(Reference(writer.sheets["Results"],min_col=y_index,min_row=1,max_row=min(len(df),100)+1),titles_from_data=True)
-                    if chart_spec.get("x") in df.columns:
-                        x_index=list(df.columns).index(chart_spec["x"])+1
-                        chart.set_categories(Reference(writer.sheets["Results"],min_col=x_index,min_row=2,max_row=min(len(df),100)+1))
+                if y_name in safe_df.columns:
+                    y_index=list(safe_df.columns).index(y_name)+1
+                    chart.add_data(Reference(writer.sheets["Results"],min_col=y_index,min_row=1,max_row=min(len(safe_df),100)+1),titles_from_data=True)
+                    if chart_spec.get("x") in safe_df.columns:
+                        x_index=list(safe_df.columns).index(chart_spec["x"])+1
+                        chart.set_categories(Reference(writer.sheets["Results"],min_col=x_index,min_row=2,max_row=min(len(safe_df),100)+1))
                     writer.sheets["Results"].add_chart(chart,"E2")
         return Response(output.getvalue(),media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",headers={"Content-Disposition":"attachment; filename=querylens-report.xlsx"})
     from reportlab.lib.pagesizes import letter

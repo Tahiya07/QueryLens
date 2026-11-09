@@ -4,7 +4,7 @@ import pytest
 
 _folder=tempfile.TemporaryDirectory()
 os.environ["QUERYLENS_DATA_DIR"]=_folder.name
-os.environ["QUERYLENS_SECRET_KEY"]="pytest-only-secret-value"
+os.environ["QUERYLENS_SECRET_KEY"]="pytest-only-secret-value-000000000000000"
 
 @pytest.fixture(scope="session", autouse=True)
 def dispose_database_engine():
@@ -12,6 +12,13 @@ def dispose_database_engine():
     from app.security import _engine
     _engine.dispose()
     _folder.cleanup()
+
+@pytest.fixture(autouse=True)
+def reset_rate_limiter():
+    from app.main import app
+    from app.rate_limit import LocalRateLimiter
+    app.state.rate_limiter = LocalRateLimiter()
+    yield
 
 @pytest.fixture
 def sales_frame():
