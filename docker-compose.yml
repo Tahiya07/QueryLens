@@ -1,0 +1,40 @@
+services:
+  postgres:
+    image: postgres:16.15
+    environment:
+      POSTGRES_DB: querylens
+      POSTGRES_USER: querylens
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U querylens -d querylens"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  api:
+    build: ./backend
+    environment:
+      QUERYLENS_DATA_DIR: /data
+      QUERYLENS_SECRET_KEY: ${QUERYLENS_SECRET_KEY:?Set QUERYLENS_SECRET_KEY in .env}
+      QUERYLENS_CORS_ORIGINS: http://localhost:3000
+      QUERYLENS_DATABASE_URL: postgresql+psycopg://querylens:${POSTGRES_PASSWORD}@postgres:5432/querylens
+    volumes:
+      - querylens-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+  web:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    depends_on:
+      - api
+    ports:
+      - "3000:3000"
+volumes:
+  querylens-data:
+  postgres-data:
